@@ -18,10 +18,10 @@ use glutin::surface::{Surface, SwapInterval, WindowSurface};
 use log::{debug, info};
 use parking_lot::MutexGuard;
 use serde::{Deserialize, Serialize};
+use winit::cursor::CursorIcon;
 use winit::dpi::PhysicalSize;
 use winit::keyboard::ModifiersState;
 use winit::raw_window_handle::RawWindowHandle;
-use winit::window::CursorIcon;
 
 use crossfont::{Rasterize, Rasterizer, Size as FontSize};
 use unicode_width::UnicodeWidthChar;
@@ -422,13 +422,13 @@ impl Display {
         // Resize the window to account for the user configured size.
         if let Some(dimensions) = config.window.dimensions() {
             let size = window_size(config, dimensions, cell_width, cell_height, scale_factor);
-            window.request_inner_size(size);
+            window.request_surface_size(size);
         }
 
         // Create the GL surface to draw into.
         let surface = platform::create_gl_surface(
             &gl_context,
-            window.inner_size(),
+            window.surface_size(),
             window.raw_window_handle(),
         )?;
 
@@ -445,7 +445,7 @@ impl Display {
         });
 
         let padding = config.window.padding(window.scale_factor as f32);
-        let viewport_size = window.inner_size();
+        let viewport_size = window.surface_size();
 
         // Create new size with at least one column and row.
         let size_info = SizeInfo::new(
@@ -949,16 +949,16 @@ impl Display {
         };
 
         // Handle IME.
-        if self.ime.is_enabled() {
-            if let Some(point) = ime_position {
-                let (fg, bg) = if search_state.regex().is_some() {
-                    (config.colors.footer_bar_foreground(), config.colors.footer_bar_background())
-                } else {
-                    (foreground_color, background_color)
-                };
+        if self.ime.is_enabled()
+            && let Some(point) = ime_position
+        {
+            let (fg, bg) = if search_state.regex().is_some() {
+                (config.colors.footer_bar_foreground(), config.colors.footer_bar_background())
+            } else {
+                (foreground_color, background_color)
+            };
 
-                self.draw_ime_preview(point, fg, bg, &mut rects, config);
-            }
+            self.draw_ime_preview(point, fg, bg, &mut rects, config);
         }
 
         if let Some(message) = message_buffer.message() {
@@ -1441,7 +1441,9 @@ impl Display {
             / self
                 .window
                 .current_monitor()
-                .and_then(|monitor| monitor.refresh_rate_millihertz())
+                .and_then(|monitor| monitor.current_video_mode())
+                .and_then(|mode| mode.refresh_rate_millihertz())
+                .map(|r| r.get())
                 .unwrap_or(60_000) as f64;
 
         // Now convert it to micro seconds.

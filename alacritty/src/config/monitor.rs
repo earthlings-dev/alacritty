@@ -30,7 +30,11 @@ pub struct ConfigMonitor {
 }
 
 impl ConfigMonitor {
-    pub fn new(mut paths: Vec<PathBuf>, event_proxy: EventLoopProxy<Event>) -> Option<Self> {
+    pub fn new(
+        mut paths: Vec<PathBuf>,
+        event_sender: mpsc::Sender<Event>,
+        event_proxy: EventLoopProxy,
+    ) -> Option<Self> {
         // Don't monitor config if there is no path to watch.
         if paths.is_empty() {
             return None;
@@ -137,7 +141,8 @@ impl ConfigMonitor {
                         {
                             // Always reload the primary configuration file.
                             let event = Event::new(EventType::ConfigReload(paths[0].clone()), None);
-                            let _ = event_proxy.send_event(event);
+                            let _ = event_sender.send(event);
+                            event_proxy.wake_up();
                         }
                     },
                     Ok(Err(err)) => {

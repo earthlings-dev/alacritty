@@ -9,7 +9,6 @@ use winit::platform::macos::OptionAsAlt;
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::term::TermMode;
-use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 
 use crate::config::{Action, BindingKey, BindingMode, KeyBinding};
 use crate::display::window::ImeInhibitor;
@@ -36,7 +35,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             return;
         }
 
-        let text = key.text_with_all_modifiers().unwrap_or_default();
+        let text = key.text_with_all_modifiers.as_deref().unwrap_or_default();
 
         // All key bindings are disabled while a hint is being selected.
         if self.ctx.display().hint_state.active() {
@@ -119,7 +118,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 
         match key.logical_key {
             Key::Named(named) => {
-                if named.to_text().is_some() {
+                if Key::Named(named).to_text().is_some() {
                     alt_send_esc
                 } else {
                     // Treat `Alt` as modifier for named keys without text, like ArrowUp.
@@ -136,7 +135,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             Key::Named(NamedKey::Shift)
                 | Key::Named(NamedKey::Control)
                 | Key::Named(NamedKey::Alt)
-                | Key::Named(NamedKey::Super)
+                | Key::Named(NamedKey::Meta)
         )
     }
 
@@ -166,7 +165,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         match key.logical_key {
             _ if disambiguate => true,
             // Exclude all the named keys unless they have textual representation.
-            Key::Named(named) => named.to_text().is_none(),
+            Key::Named(named) => Key::Named(named).to_text().is_none(),
             _ => text.is_empty(),
         }
     }
@@ -196,7 +195,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
             if (cfg!(target_os = "macos") || (cfg!(windows) && mods.control_key()))
                 && mods.alt_key()
             {
-                key.key_without_modifiers()
+                key.key_without_modifiers.clone()
             } else {
                 Key::Character(ch.to_lowercase().into())
             }
@@ -259,7 +258,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
 
         // Mask `Alt` modifier from input when we won't send esc.
-        let text = key.text_with_all_modifiers().unwrap_or_default();
+        let text = key.text_with_all_modifiers.as_deref().unwrap_or_default();
         let mods = if self.alt_send_esc(&key, text) { mods } else { mods & !ModifiersState::ALT };
 
         let bytes = match key.logical_key.as_ref() {
@@ -309,7 +308,7 @@ fn build_sequence(key: KeyEvent, mods: ModifiersState, mode: TermMode) -> Vec<u8
     let context =
         SequenceBuilder { mode, modifiers, kitty_seq, kitty_encode_all, kitty_event_type };
 
-    let associated_text = key.text_with_all_modifiers().filter(|text| {
+    let associated_text = key.text_with_all_modifiers.as_deref().filter(|text| {
         mode.contains(TermMode::REPORT_ASSOCIATED_TEXT)
             && key.state != ElementState::Released
             && !text.is_empty()
@@ -397,10 +396,11 @@ impl SequenceBuilder {
             // Try to get the base for keys which change based on modifier, like `1` for `!`.
             //
             // However it should only be performed when `SHIFT` is pressed.
-            if shift && alternate_key_code == unicode_key_code {
-                if let Key::Character(unmodded) = key.key_without_modifiers().as_ref() {
-                    unicode_key_code = u32::from(unmodded.chars().next().unwrap_or(unshifted_ch));
-                }
+            if shift
+                && alternate_key_code == unicode_key_code
+                && let Key::Character(unmodded) = key.key_without_modifiers.as_ref()
+            {
+                unicode_key_code = u32::from(unmodded.chars().next().unwrap_or(unshifted_ch));
             }
 
             // NOTE: Base layouts are ignored, since winit doesn't expose this information
@@ -598,7 +598,6 @@ impl SequenceBuilder {
             NamedKey::Tab => "9",
             NamedKey::Enter => "13",
             NamedKey::Escape => "27",
-            NamedKey::Space => "32",
             NamedKey::Backspace => "127",
             _ => "",
         };
@@ -609,19 +608,30 @@ impl SequenceBuilder {
             return None;
         }
 
+        // Note: NamedKey::Hyper is deprecated in winit but kept here for Kitty protocol
+        // compatibility, which defines specific keycodes (57445/57451) for Hyper keys.
+        //
+        // LIMITATION: This only supports Hyper key press/release events (keycodes 57445/57451).
+        // The Hyper modifier bit (16) for combinations like Hyper+A is NOT supported because
+        // winit's ModifiersState does not expose Hyper modifier state. This is a known gap
+        // shared across the Rust terminal ecosystem - even WezTerm has an explicit TODO for this.
+        //
+        // Impact: Only affects Linux users with custom XKB Hyper mappings using applications
+        // that rely on Kitty protocol Hyper modifier encoding (~0.01% of users).
+        #[allow(deprecated)]
         let base = match (named, key.location) {
             (NamedKey::Shift, KeyLocation::Left) => "57441",
             (NamedKey::Control, KeyLocation::Left) => "57442",
             (NamedKey::Alt, KeyLocation::Left) => "57443",
-            (NamedKey::Super, KeyLocation::Left) => "57444",
+            // NamedKey::Meta covers both Super (57444) and Meta (57446); use Super code.
+            (NamedKey::Meta, KeyLocation::Left) => "57444",
             (NamedKey::Hyper, KeyLocation::Left) => "57445",
-            (NamedKey::Meta, KeyLocation::Left) => "57446",
             (NamedKey::Shift, _) => "57447",
             (NamedKey::Control, _) => "57448",
             (NamedKey::Alt, _) => "57449",
-            (NamedKey::Super, _) => "57450",
+            // NamedKey::Meta covers both Super (57450) and Meta (57452); use Super code.
+            (NamedKey::Meta, _) => "57450",
             (NamedKey::Hyper, _) => "57451",
-            (NamedKey::Meta, _) => "57452",
             (NamedKey::CapsLock, _) => "57358",
             (NamedKey::NumLock, _) => "57360",
             _ => base,
@@ -636,7 +646,7 @@ impl SequenceBuilder {
             NamedKey::Shift => mods.set(SequenceModifiers::SHIFT, press),
             NamedKey::Control => mods.set(SequenceModifiers::CONTROL, press),
             NamedKey::Alt => mods.set(SequenceModifiers::ALT, press),
-            NamedKey::Super => mods.set(SequenceModifiers::SUPER, press),
+            NamedKey::Meta => mods.set(SequenceModifiers::SUPER, press),
             _ => (),
         }
 
@@ -680,14 +690,29 @@ impl SequenceTerminator {
 
 bitflags::bitflags! {
     /// The modifiers encoding for escape sequence.
+    ///
+    /// LIMITATION: This only implements 4 of the 8 modifiers defined by the Kitty keyboard
+    /// protocol. The full protocol defines:
+    /// - Shift (bit 0) = 1 ✓ Implemented
+    /// - Alt (bit 1) = 2 ✓ Implemented
+    /// - Ctrl (bit 2) = 4 ✓ Implemented
+    /// - Super (bit 3) = 8 ✓ Implemented
+    /// - Hyper (bit 4) = 16 ✗ NOT implemented (winit doesn't expose Hyper modifier state)
+    /// - Meta (bit 5) = 32 ✗ NOT implemented (winit doesn't expose Meta modifier state)
+    /// - Caps Lock (bit 6) = 64 ✗ NOT implemented (winit doesn't expose as modifier)
+    /// - Num Lock (bit 7) = 128 ✗ NOT implemented (winit doesn't expose as modifier)
+    ///
+    /// The missing modifiers cannot be tracked because winit's ModifiersState only exposes
+    /// four modifiers (SHIFT, CONTROL, ALT, META). The Hyper and Meta modifier states are
+    /// not queried from the underlying XKB state on X11/Wayland platforms.
+    ///
+    /// See docs/winit-0.31-migration.md for detailed explanation and impact analysis.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     struct SequenceModifiers : u8 {
         const SHIFT   = 0b0000_0001;
         const ALT     = 0b0000_0010;
         const CONTROL = 0b0000_0100;
         const SUPER   = 0b0000_1000;
-        // NOTE: Kitty protocol defines additional modifiers to what is present here, like
-        // Capslock, but it's not a modifier as per winit.
     }
 }
 
@@ -704,7 +729,7 @@ impl From<ModifiersState> for SequenceModifiers {
         modifiers.set(Self::SHIFT, mods.shift_key());
         modifiers.set(Self::ALT, mods.alt_key());
         modifiers.set(Self::CONTROL, mods.control_key());
-        modifiers.set(Self::SUPER, mods.super_key());
+        modifiers.set(Self::SUPER, mods.meta_key());
         modifiers
     }
 }

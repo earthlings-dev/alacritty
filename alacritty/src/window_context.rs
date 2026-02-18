@@ -7,7 +7,7 @@ use std::mem;
 #[cfg(not(windows))]
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::rc::Rc;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::time::Instant;
 
 use glutin::config::Config as GlutinConfig;
@@ -16,7 +16,7 @@ use glutin::display::GetGlDisplay;
 use glutin::platform::x11::X11GlConfigExt;
 use log::info;
 use serde_json as json;
-use winit::event::{Event as WinitEvent, Modifiers, WindowEvent};
+use winit::event::{Modifiers, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::WindowId;
@@ -44,12 +44,38 @@ use crate::message_bar::MessageBuffer;
 use crate::scheduler::Scheduler;
 use crate::{input, renderer};
 
+/// Internal event type for window event queue.
+///
+/// This enum wraps winit's `WindowEvent` and Alacritty's custom `Event` types
+/// for queuing in `WindowContext::event_queue`. Events are queued as they arrive
+/// and processed in batches during `RedrawRequested` or `AboutToWait`.
+///
+/// Note: This is distinct from winit's event types - it's an internal type
+/// for Alacritty's event batching system.
+#[derive(Debug, Clone)]
+pub enum WinitEvent {
+    WindowEvent {
+        #[allow(dead_code)]
+        window_id: WindowId,
+        event: WindowEvent,
+    },
+    UserEvent(Event),
+    AboutToWait,
+}
+
+impl From<Event> for WinitEvent {
+    fn from(event: Event) -> Self {
+        WinitEvent::UserEvent(event)
+    }
+}
+
 /// Event context for one individual Alacritty window.
 pub struct WindowContext {
     pub message_buffer: MessageBuffer,
     pub display: Display,
     pub dirty: bool,
-    event_queue: Vec<WinitEvent<Event>>,
+    event_queue: Vec<WinitEvent>,
+    event_proxy: EventProxy,
     terminal: Arc<FairMutex<Term<EventProxy>>>,
     cursor_blink_timed_out: bool,
     prev_bell_cmd: Option<Instant>,
@@ -72,8 +98,9 @@ pub struct WindowContext {
 impl WindowContext {
     /// Create initial window context that does bootstrapping the graphics API we're going to use.
     pub fn initial(
-        event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Event>,
+        event_loop: &dyn ActiveEventLoop,
+        proxy: EventLoopProxy,
+        event_sender: mpsc::Sender<Event>,
         config: Rc<UiConfig>,
         mut options: WindowOptions,
     ) -> Result<Self, Box<dyn Error>> {
@@ -115,14 +142,15 @@ impl WindowContext {
 
         let display = Display::new(window, gl_context, &config, false)?;
 
-        Self::new(display, config, options, proxy)
+        Self::new(display, config, options, proxy, event_sender)
     }
 
     /// Create additional context with the graphics platform other windows are using.
     pub fn additional(
         gl_config: &GlutinConfig,
-        event_loop: &ActiveEventLoop,
-        proxy: EventLoopProxy<Event>,
+        event_loop: &dyn ActiveEventLoop,
+        proxy: EventLoopProxy,
+        event_sender: mpsc::Sender<Event>,
         config: Rc<UiConfig>,
         mut options: WindowOptions,
         config_overrides: ParsedOptions,
@@ -155,7 +183,7 @@ impl WindowContext {
 
         let display = Display::new(window, gl_context, &config, tabbed)?;
 
-        let mut window_context = Self::new(display, config, options, proxy)?;
+        let mut window_context = Self::new(display, config, options, proxy, event_sender)?;
 
         // Set the config overrides at startup.
         //
@@ -170,7 +198,8 @@ impl WindowContext {
         display: Display,
         config: Rc<UiConfig>,
         options: WindowOptions,
-        proxy: EventLoopProxy<Event>,
+        proxy: EventLoopProxy,
+        event_sender: mpsc::Sender<Event>,
     ) -> Result<Self, Box<dyn Error>> {
         let mut pty_config = config.pty_config();
         options.terminal_options.override_pty_config(&mut pty_config);
@@ -183,7 +212,7 @@ impl WindowContext {
             display.size_info.columns()
         );
 
-        let event_proxy = EventProxy::new(proxy, display.window.id());
+        let event_proxy = EventProxy::new(event_sender, proxy, display.window.id());
 
         // Create the terminal.
         //
@@ -198,7 +227,8 @@ impl WindowContext {
         // The PTY forks a process to run the shell on the slave side of the
         // pseudoterminal. A file descriptor for the master side is retained for
         // reading/writing to the shell.
-        let pty = tty::new(&pty_config, display.size_info.into(), display.window.id().into())?;
+        let pty =
+            tty::new(&pty_config, display.size_info.into(), display.window.id().into_raw() as u64)?;
 
         #[cfg(not(windows))]
         let master_fd = pty.file().as_raw_fd();
@@ -236,6 +266,7 @@ impl WindowContext {
             preserve_title,
             terminal,
             display,
+            event_proxy,
             #[cfg(not(windows))]
             master_fd,
             #[cfg(not(windows))]
@@ -400,11 +431,11 @@ impl WindowContext {
     /// Process events for this terminal window.
     pub fn handle_event(
         &mut self,
-        #[cfg(target_os = "macos")] event_loop: &ActiveEventLoop,
-        event_proxy: &EventLoopProxy<Event>,
+        #[cfg(target_os = "macos")] event_loop: &dyn ActiveEventLoop,
+        _event_proxy: &EventLoopProxy,
         clipboard: &mut Clipboard,
         scheduler: &mut Scheduler,
-        event: WinitEvent<Event>,
+        event: WinitEvent,
     ) {
         match event {
             WinitEvent::AboutToWait
@@ -446,7 +477,7 @@ impl WindowContext {
             shell_pid: self.shell_pid,
             preserve_title: self.preserve_title,
             config: &self.config,
-            event_proxy,
+            event_proxy: &self.event_proxy,
             #[cfg(target_os = "macos")]
             event_loop,
             clipboard,

@@ -1,9 +1,13 @@
 //! Scheduler for emitting events at a specific time in the future.
+//!
+//! The scheduler runs exclusively on the main thread and is updated from
+//! `ApplicationHandler::about_to_wait()`. Instead of sending events through the
+//! mpsc channel, it returns fired events directly for immediate processing on the
+//! same thread, avoiding unnecessary channel overhead.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use winit::event_loop::EventLoopProxy;
 use winit::window::WindowId;
 
 use crate::event::Event;
@@ -43,20 +47,21 @@ pub struct Timer {
 /// Scheduler tracking all pending timers.
 pub struct Scheduler {
     timers: VecDeque<Timer>,
-    event_proxy: EventLoopProxy<Event>,
 }
 
 impl Scheduler {
-    pub fn new(event_proxy: EventLoopProxy<Event>) -> Self {
-        Self { timers: VecDeque::new(), event_proxy }
+    pub fn new() -> Self {
+        Self { timers: VecDeque::new() }
     }
 
     /// Process all pending timers.
     ///
-    /// If there are still timers pending after all ready events have been processed, the closest
-    /// pending deadline will be returned.
-    pub fn update(&mut self) -> Option<Instant> {
+    /// Returns a tuple of (fired_events, next_deadline). The fired_events vector contains all
+    /// events whose deadlines have passed. The next_deadline is the closest pending deadline,
+    /// or None if there are no more pending timers.
+    pub fn update(&mut self) -> (Vec<Event>, Option<Instant>) {
         let now = Instant::now();
+        let mut fired_events = Vec::new();
 
         while !self.timers.is_empty() && self.timers[0].deadline <= now {
             if let Some(timer) = self.timers.pop_front() {
@@ -65,11 +70,11 @@ impl Scheduler {
                     self.schedule(timer.event.clone(), interval, true, timer.id);
                 }
 
-                let _ = self.event_proxy.send_event(timer.event);
+                fired_events.push(timer.event);
             }
         }
 
-        self.timers.front().map(|timer| timer.deadline)
+        (fired_events, self.timers.front().map(|timer| timer.deadline))
     }
 
     /// Schedule a new event.

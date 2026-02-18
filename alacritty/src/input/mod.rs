@@ -15,16 +15,14 @@ use std::mem;
 use std::time::{Duration, Instant};
 
 use log::debug;
+use winit::cursor::CursorIcon;
 use winit::dpi::PhysicalPosition;
-use winit::event::{
-    ElementState, Modifiers, MouseButton, MouseScrollDelta, Touch as TouchEvent, TouchPhase,
-};
+use winit::event::{ElementState, Modifiers, MouseButton, MouseScrollDelta, TouchPhase};
 #[cfg(target_os = "macos")]
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::ModifiersState;
 #[cfg(target_os = "macos")]
 use winit::platform::macos::ActiveEventLoopExtMacOS;
-use winit::window::CursorIcon;
 
 use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::{Dimensions, Scroll};
@@ -45,7 +43,7 @@ use crate::display::hint::HintMatch;
 use crate::display::window::{ImeInhibitor, Window};
 use crate::display::{Display, SizeInfo};
 use crate::event::{
-    ClickState, Event, EventType, InlineSearchState, Mouse, TouchPurpose, TouchZoom,
+    ClickState, Event, EventType, InlineSearchState, Mouse, TouchPoint, TouchPurpose, TouchZoom,
 };
 use crate::message_bar::{self, Message};
 use crate::scheduler::{Scheduler, TimerId, Topic};
@@ -109,7 +107,7 @@ pub trait ActionContext<T: EventListener> {
     fn message(&self) -> Option<&Message>;
     fn config(&self) -> &UiConfig;
     #[cfg(target_os = "macos")]
-    fn event_loop(&self) -> &ActiveEventLoop;
+    fn event_loop(&self) -> &dyn ActiveEventLoop;
     fn mouse_mode(&self) -> bool;
     fn clipboard_mut(&mut self) -> &mut Clipboard;
     fn scheduler_mut(&mut self) -> &mut Scheduler;
@@ -624,7 +622,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 MouseButton::Middle => 1,
                 MouseButton::Right => 2,
                 // Can't properly report more than three buttons..
-                MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => return,
+                _ => return,
             };
 
             self.mouse_report(code, ElementState::Pressed);
@@ -700,7 +698,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
                 MouseButton::Middle => 1,
                 MouseButton::Right => 2,
                 // Can't properly report more than three buttons.
-                MouseButton::Back | MouseButton::Forward | MouseButton::Other(_) => return,
+                _ => return,
             };
             self.mouse_report(code, ElementState::Released);
             return;
@@ -836,17 +834,8 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
         }
     }
 
-    /// Handle touch input.
-    pub fn touch(&mut self, touch: TouchEvent) {
-        match touch.phase {
-            TouchPhase::Started => self.on_touch_start(touch),
-            TouchPhase::Moved => self.on_touch_motion(touch),
-            TouchPhase::Ended | TouchPhase::Cancelled => self.on_touch_end(touch),
-        }
-    }
-
     /// Handle beginning of touch input.
-    pub fn on_touch_start(&mut self, touch: TouchEvent) {
+    pub fn on_touch_start(&mut self, touch: TouchPoint) {
         // Inhibit IME on touch while not focused, forcing a touch tap while focused to enable IME.
         if !self.ctx.terminal().is_focused {
             self.ctx.window().set_ime_inhibitor(ImeInhibitor::TOUCH, true);
@@ -879,7 +868,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     /// Handle touch input movement.
-    pub fn on_touch_motion(&mut self, touch: TouchEvent) {
+    pub fn on_touch_motion(&mut self, touch: TouchPoint) {
         let touch_purpose = self.ctx.touch_purpose();
         match touch_purpose {
             TouchPurpose::None => (),
@@ -924,7 +913,7 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
     }
 
     /// Handle end of touch input.
-    pub fn on_touch_end(&mut self, touch: TouchEvent) {
+    pub fn on_touch_end(&mut self, touch: TouchPoint) {
         // Finalize the touch motion up to the release point.
         self.on_touch_motion(touch);
 
@@ -1152,11 +1141,11 @@ impl<T: EventListener, A: ActionContext<T>> Processor<T, A> {
 mod tests {
     use super::*;
 
-    use winit::event::{DeviceId, Event as WinitEvent, WindowEvent};
+    use winit::event::{ButtonSource, WindowEvent};
     use winit::keyboard::Key;
     use winit::window::WindowId;
 
-    use alacritty_terminal::event::Event as TerminalEvent;
+    use crate::window_context::WinitEvent;
 
     use crate::config::Binding;
     use crate::message_bar::MessageBuffer;
@@ -1267,7 +1256,7 @@ mod tests {
         }
 
         #[cfg(target_os = "macos")]
-        fn event_loop(&self) -> &ActiveEventLoop {
+        fn event_loop(&self) -> &dyn ActiveEventLoop {
             unimplemented!();
         }
 
@@ -1328,11 +1317,11 @@ mod tests {
 
                 let mut processor = Processor::new(context);
 
-                let event: WinitEvent::<TerminalEvent> = $input;
+                let event: WinitEvent = $input;
                 if let WinitEvent::WindowEvent {
-                    event: WindowEvent::MouseInput {
+                    event: WindowEvent::PointerButton {
                         state,
-                        button,
+                        button: ButtonSource::Mouse(button),
                         ..
                     },
                     ..
@@ -1368,14 +1357,16 @@ mod tests {
     test_clickstate! {
         name: single_click,
         initial_state: ClickState::None,
-        initial_button: MouseButton::Other(0),
+        initial_button: MouseButton::Middle,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
-                device_id: DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Left),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id: WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::Click,
         input_delay: Duration::ZERO,
@@ -1384,14 +1375,16 @@ mod tests {
     test_clickstate! {
         name: single_right_click,
         initial_state: ClickState::None,
-        initial_button: MouseButton::Other(0),
+        initial_button: MouseButton::Middle,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Right,
-                device_id: DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Right),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id: WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::Click,
         input_delay: Duration::ZERO,
@@ -1400,14 +1393,16 @@ mod tests {
     test_clickstate! {
         name: single_middle_click,
         initial_state: ClickState::None,
-        initial_button: MouseButton::Other(0),
+        initial_button: MouseButton::Middle,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Middle,
-                device_id: DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Middle),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id: WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::Click,
         input_delay: Duration::ZERO,
@@ -1418,12 +1413,14 @@ mod tests {
         initial_state: ClickState::Click,
         initial_button: MouseButton::Left,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
-                device_id: DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Left),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id: WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::DoubleClick,
         input_delay: Duration::ZERO,
@@ -1434,12 +1431,14 @@ mod tests {
         initial_state: ClickState::Click,
         initial_button: MouseButton::Left,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
-                device_id: DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Left),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id: WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::Click,
         input_delay: CLICK_THRESHOLD,
@@ -1450,12 +1449,14 @@ mod tests {
         initial_state: ClickState::DoubleClick,
         initial_button: MouseButton::Left,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
-                device_id:  DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Left),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id:  WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::TripleClick,
         input_delay: Duration::ZERO,
@@ -1466,12 +1467,14 @@ mod tests {
         initial_state: ClickState::DoubleClick,
         initial_button: MouseButton::Left,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Left,
-                device_id: DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Left),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id: WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::Click,
         input_delay: CLICK_THRESHOLD,
@@ -1482,12 +1485,14 @@ mod tests {
         initial_state: ClickState::DoubleClick,
         initial_button: MouseButton::Left,
         input: WinitEvent::WindowEvent {
-            event: WindowEvent::MouseInput {
+            event: WindowEvent::PointerButton {
                 state: ElementState::Pressed,
-                button: MouseButton::Right,
-                device_id: DeviceId::dummy(),
+                button: ButtonSource::Mouse(MouseButton::Right),
+                device_id: None,
+                position: PhysicalPosition::new(0.0, 0.0),
+                primary: true,
             },
-            window_id: WindowId::dummy(),
+            window_id: WindowId::from_raw(0),
         },
         end_state: ClickState::Click,
         input_delay: Duration::ZERO,
@@ -1551,9 +1556,9 @@ mod tests {
 
     test_process_binding! {
         name: process_binding_fail_with_extra_mods,
-        binding: Binding { trigger: KEY, mods: ModifiersState::SUPER, action: Action::from("arst"), mode: BindingMode::empty(), notmode: BindingMode::empty() },
+        binding: Binding { trigger: KEY, mods: ModifiersState::META, action: Action::from("arst"), mode: BindingMode::empty(), notmode: BindingMode::empty() },
         triggers: false,
         mode: BindingMode::empty(),
-        mods: ModifiersState::ALT | ModifiersState::SUPER,
+        mods: ModifiersState::ALT | ModifiersState::META,
     }
 }

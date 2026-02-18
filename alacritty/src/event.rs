@@ -1,4 +1,20 @@
 //! Process window events.
+//!
+//! # Event Architecture
+//!
+//! Alacritty uses a multi-threaded event system:
+//!
+//! - **Main thread**: Runs the winit `EventLoop` via `ApplicationHandler` trait
+//! - **PTY thread**: Reads/writes to the pseudoterminal
+//! - **IPC thread**: Listens for socket commands (Unix only)
+//! - **Config monitor thread**: Watches for config file changes
+//!
+//! Cross-thread communication uses an `mpsc::channel<Event>` + `EventLoopProxy`:
+//! 1. Background threads send events: `sender.send(event)` then `proxy.wake_up()`
+//! 2. Main thread receives via `ApplicationHandler::proxy_wake_up()` → `receiver.try_iter()`
+//!
+//! The `Scheduler` is special-cased: it runs only on the main thread and returns fired
+//! events directly from `update()` rather than using the channel.
 
 use crate::ConfigMonitor;
 use glutin::config::GetGlConfig;
@@ -17,6 +33,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 #[cfg(unix)]
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use std::{env, f32, mem};
 
@@ -26,9 +43,10 @@ use glutin::config::Config as GlutinConfig;
 use glutin::display::GetGlDisplay;
 use log::{debug, error, info, warn};
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalPosition;
 use winit::event::{
-    ElementState, Event as WinitEvent, Ime, Modifiers, MouseButton, StartCause,
-    Touch as TouchEvent, WindowEvent,
+    ButtonSource, ElementState, FingerId, Ime, Modifiers, MouseButton, PointerSource, StartCause,
+    WindowEvent,
 };
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::raw_window_handle::HasDisplayHandle;
@@ -63,7 +81,7 @@ use crate::ipc::{self, SocketReply};
 use crate::logging::{LOG_TARGET_CONFIG, LOG_TARGET_WINIT};
 use crate::message_bar::{Message, MessageBuffer};
 use crate::scheduler::{Scheduler, TimerId, Topic};
-use crate::window_context::WindowContext;
+use crate::window_context::{WindowContext, WinitEvent};
 
 /// Duration after the last user input until an unlimited search is performed.
 pub const TYPING_SEARCH_DELAY: Duration = Duration::from_millis(500);
@@ -92,7 +110,9 @@ pub struct Processor {
     initial_window_options: Option<WindowOptions>,
     initial_window_error: Option<Box<dyn Error>>,
     windows: HashMap<WindowId, WindowContext, RandomState>,
-    proxy: EventLoopProxy<Event>,
+    proxy: EventLoopProxy,
+    event_sender: mpsc::Sender<Event>,
+    event_receiver: mpsc::Receiver<Event>,
     gl_config: Option<GlutinConfig>,
     #[cfg(unix)]
     global_ipc_options: ParsedOptions,
@@ -105,10 +125,12 @@ impl Processor {
     pub fn new(
         config: UiConfig,
         cli_options: CliOptions,
-        event_loop: &EventLoop<Event>,
+        event_loop: &EventLoop,
+        event_sender: mpsc::Sender<Event>,
+        event_receiver: mpsc::Receiver<Event>,
     ) -> Processor {
         let proxy = event_loop.create_proxy();
-        let scheduler = Scheduler::new(proxy.clone());
+        let scheduler = Scheduler::new();
         let initial_window_options = Some(cli_options.window_options.clone());
 
         // Disable all device events, since we don't care about them.
@@ -124,8 +146,11 @@ impl Processor {
         // config changes are processed in the main loop.
         let mut config_monitor = None;
         if config.live_config_reload() {
-            config_monitor =
-                ConfigMonitor::new(config.config_paths.clone(), event_loop.create_proxy());
+            config_monitor = ConfigMonitor::new(
+                config.config_paths.clone(),
+                event_sender.clone(),
+                event_loop.create_proxy(),
+            );
         }
 
         Processor {
@@ -133,6 +158,8 @@ impl Processor {
             initial_window_error: None,
             cli_options,
             proxy,
+            event_sender,
+            event_receiver,
             scheduler,
             gl_config: None,
             config: Rc::new(config),
@@ -150,12 +177,13 @@ impl Processor {
     /// will be used for the rest of the windows.
     pub fn create_initial_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn ActiveEventLoop,
         window_options: WindowOptions,
     ) -> Result<(), Box<dyn Error>> {
         let window_context = WindowContext::initial(
             event_loop,
             self.proxy.clone(),
+            self.event_sender.clone(),
             self.config.clone(),
             window_options,
         )?;
@@ -169,7 +197,7 @@ impl Processor {
     /// Create a new terminal window.
     pub fn create_window(
         &mut self,
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn ActiveEventLoop,
         options: WindowOptions,
     ) -> Result<(), Box<dyn Error>> {
         let gl_config = self.gl_config.as_ref().unwrap();
@@ -185,6 +213,7 @@ impl Processor {
             gl_config,
             event_loop,
             self.proxy.clone(),
+            self.event_sender.clone(),
             config,
             options,
             config_overrides,
@@ -197,11 +226,12 @@ impl Processor {
     /// Run the event loop.
     ///
     /// The result is exit code generate from the loop.
-    pub fn run(&mut self, event_loop: EventLoop<Event>) -> Result<(), Box<dyn Error>> {
-        let result = event_loop.run_app(self);
+    pub fn run(&mut self, mut event_loop: EventLoop) -> Result<(), Box<dyn Error>> {
+        use winit::event_loop::run_on_demand::EventLoopExtRunOnDemand;
+        event_loop.run_app_on_demand(&mut *self)?;
         match self.initial_window_error.take() {
             Some(initial_window_error) => Err(initial_window_error),
-            _ => result.map_err(Into::into),
+            _ => Ok(()),
         }
     }
 
@@ -214,41 +244,45 @@ impl Processor {
                 | WindowEvent::DoubleTapGesture { .. }
                 | WindowEvent::TouchpadPressure { .. }
                 | WindowEvent::RotationGesture { .. }
-                | WindowEvent::CursorEntered { .. }
+                | WindowEvent::PointerEntered { .. }
                 | WindowEvent::PinchGesture { .. }
-                | WindowEvent::AxisMotion { .. }
                 | WindowEvent::PanGesture { .. }
-                | WindowEvent::HoveredFileCancelled
+                | WindowEvent::DragLeft { .. }
                 | WindowEvent::Destroyed
                 | WindowEvent::ThemeChanged(_)
-                | WindowEvent::HoveredFile(_)
+                | WindowEvent::DragEntered { .. }
+                | WindowEvent::DragMoved { .. }
                 | WindowEvent::Moved(_)
         )
     }
 }
 
-impl ApplicationHandler<Event> for Processor {
-    fn resumed(&mut self, _event_loop: &ActiveEventLoop) {}
-
-    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-        if cause != StartCause::Init || self.cli_options.daemon {
+impl ApplicationHandler for Processor {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.cli_options.daemon {
             return;
         }
 
-        if let Some(window_options) = self.initial_window_options.take() {
-            if let Err(err) = self.create_initial_window(event_loop, window_options) {
-                self.initial_window_error = Some(err);
-                event_loop.exit();
-                return;
-            }
+        if let Some(window_options) = self.initial_window_options.take()
+            && let Err(err) = self.create_initial_window(event_loop, window_options)
+        {
+            self.initial_window_error = Some(err);
+            event_loop.exit();
+            return;
         }
 
         info!("Initialisation complete");
     }
 
+    fn resumed(&mut self, _event_loop: &dyn ActiveEventLoop) {}
+
+    fn new_events(&mut self, _event_loop: &dyn ActiveEventLoop, _cause: StartCause) {
+        // Window creation now happens in can_create_surfaces
+    }
+
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
+        _event_loop: &dyn ActiveEventLoop,
         window_id: WindowId,
         event: WindowEvent,
     ) {
@@ -282,11 +316,61 @@ impl ApplicationHandler<Event> for Processor {
         }
     }
 
-    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Event) {
+    fn proxy_wake_up(&mut self, event_loop: &dyn ActiveEventLoop) {
         if self.config.debug.print_events {
-            info!(target: LOG_TARGET_WINIT, "{event:?}");
+            info!(target: LOG_TARGET_WINIT, "proxy_wake_up");
         }
 
+        // Drain all pending events from the channel.
+        let events: Vec<Event> = self.event_receiver.try_iter().collect();
+        for event in events {
+            if self.config.debug.print_events {
+                info!(target: LOG_TARGET_WINIT, "{event:?}");
+            }
+            self.handle_user_event(event_loop, event);
+        }
+    }
+
+    fn destroy_surfaces(&mut self, _event_loop: &dyn ActiveEventLoop) {
+        self.exiting();
+    }
+
+    fn about_to_wait(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if self.config.debug.print_events {
+            info!(target: LOG_TARGET_WINIT, "About to wait");
+        }
+
+        // Dispatch event to all windows.
+        for window_context in self.windows.values_mut() {
+            window_context.handle_event(
+                #[cfg(target_os = "macos")]
+                event_loop,
+                &self.proxy,
+                &mut self.clipboard,
+                &mut self.scheduler,
+                WinitEvent::AboutToWait,
+            );
+        }
+
+        // Update the scheduler after event processing to ensure
+        // the event loop deadline is as accurate as possible.
+        let (fired_events, next_deadline) = self.scheduler.update();
+
+        // Process fired timer events directly
+        for event in fired_events {
+            self.handle_user_event(event_loop, event);
+        }
+
+        let control_flow = match next_deadline {
+            Some(instant) => ControlFlow::WaitUntil(instant),
+            None => ControlFlow::Wait,
+        };
+        event_loop.set_control_flow(control_flow);
+    }
+}
+
+impl Processor {
+    fn handle_user_event(&mut self, event_loop: &dyn ActiveEventLoop, event: Event) {
         // Handle events which don't mandate the WindowId.
         match (event.payload, event.window_id.as_ref()) {
             // Process IPC config update.
@@ -358,7 +442,11 @@ impl ApplicationHandler<Event> for Processor {
                         let paths = &self.config.config_paths;
                         self.config_monitor = if monitor.needs_restart(paths) {
                             monitor.shutdown();
-                            ConfigMonitor::new(paths.clone(), self.proxy.clone())
+                            ConfigMonitor::new(
+                                paths.clone(),
+                                self.event_sender.clone(),
+                                self.proxy.clone(),
+                            )
                         } else {
                             Some(monitor)
                         };
@@ -460,33 +548,7 @@ impl ApplicationHandler<Event> for Processor {
         };
     }
 
-    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        if self.config.debug.print_events {
-            info!(target: LOG_TARGET_WINIT, "About to wait");
-        }
-
-        // Dispatch event to all windows.
-        for window_context in self.windows.values_mut() {
-            window_context.handle_event(
-                #[cfg(target_os = "macos")]
-                event_loop,
-                &self.proxy,
-                &mut self.clipboard,
-                &mut self.scheduler,
-                WinitEvent::AboutToWait,
-            );
-        }
-
-        // Update the scheduler after event processing to ensure
-        // the event loop deadline is as accurate as possible.
-        let control_flow = match self.scheduler.update() {
-            Some(instant) => ControlFlow::WaitUntil(instant),
-            None => ControlFlow::Wait,
-        };
-        event_loop.set_control_flow(control_flow);
-    }
-
-    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+    fn exiting(&mut self) {
         if self.config.debug.print_events {
             info!("Exiting the event loop");
         }
@@ -526,12 +588,6 @@ pub struct Event {
 impl Event {
     pub fn new<I: Into<Option<WindowId>>>(payload: EventType, window_id: I) -> Self {
         Self { window_id: window_id.into(), payload }
-    }
-}
-
-impl From<Event> for WinitEvent<Event> {
-    fn from(event: Event) -> Self {
-        WinitEvent::UserEvent(event)
     }
 }
 
@@ -668,8 +724,8 @@ pub struct ActionContext<'a, N, T> {
     pub cursor_blink_timed_out: &'a mut bool,
     pub prev_bell_cmd: &'a mut Option<Instant>,
     #[cfg(target_os = "macos")]
-    pub event_loop: &'a ActiveEventLoop,
-    pub event_proxy: &'a EventLoopProxy<Event>,
+    pub event_loop: &'a dyn ActiveEventLoop,
+    pub event_proxy: &'a EventProxy,
     pub scheduler: &'a mut Scheduler,
     pub search_state: &'a mut SearchState,
     pub inline_search_state: &'a mut InlineSearchState,
@@ -887,14 +943,12 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
             options.window_tabbing_id = tabbing_id;
         }
 
-        let _ = self.event_proxy.send_event(Event::new(EventType::CreateWindow(options), None));
+        self.event_proxy.send_global_event(EventType::CreateWindow(options));
     }
 
     #[cfg(windows)]
     fn create_new_window(&mut self) {
-        let _ = self
-            .event_proxy
-            .send_event(Event::new(EventType::CreateWindow(WindowOptions::default()), None));
+        self.event_proxy.send_global_event(EventType::CreateWindow(WindowOptions::default()));
     }
 
     fn spawn_daemon<I, S>(&self, program: &str, args: I)
@@ -1481,7 +1535,7 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
     }
 
     #[cfg(target_os = "macos")]
-    fn event_loop(&self) -> &ActiveEventLoop {
+    fn event_loop(&self) -> &dyn ActiveEventLoop {
         self.event_loop
     }
 
@@ -1700,34 +1754,40 @@ impl<'a, N: Notify + 'a, T: EventListener> ActionContext<'a, N, T> {
         }
     }
 }
+/// Touch point with finger ID and location.
+#[derive(Debug, Clone, Copy)]
+pub struct TouchPoint {
+    pub id: FingerId,
+    pub location: PhysicalPosition<f64>,
+}
 
 /// Identified purpose of the touch input.
 #[derive(Default, Debug)]
 pub enum TouchPurpose {
     #[default]
     None,
-    Select(TouchEvent),
-    Scroll(TouchEvent),
+    Select(TouchPoint),
+    Scroll(TouchPoint),
     Zoom(TouchZoom),
-    ZoomPendingSlot(TouchEvent),
-    Tap(TouchEvent),
-    Invalid(HashSet<u64, RandomState>),
+    ZoomPendingSlot(TouchPoint),
+    Tap(TouchPoint),
+    Invalid(HashSet<FingerId, RandomState>),
 }
 
 /// Touch zooming state.
 #[derive(Debug)]
 pub struct TouchZoom {
-    slots: (TouchEvent, TouchEvent),
+    slots: (TouchPoint, TouchPoint),
     fractions: f32,
 }
 
 impl TouchZoom {
-    pub fn new(slots: (TouchEvent, TouchEvent)) -> Self {
+    pub fn new(slots: (TouchPoint, TouchPoint)) -> Self {
         Self { slots, fractions: Default::default() }
     }
 
     /// Get slot distance change since last update.
-    pub fn font_delta(&mut self, slot: TouchEvent) -> f32 {
+    pub fn font_delta(&mut self, slot: TouchPoint) -> f32 {
         let old_distance = self.distance();
 
         // Update touch slots.
@@ -1746,7 +1806,7 @@ impl TouchZoom {
     }
 
     /// Get active touch slots.
-    pub fn slots(&self) -> (TouchEvent, TouchEvent) {
+    pub fn slots(&self) -> (TouchPoint, TouchPoint) {
         self.slots
     }
 
@@ -1833,7 +1893,7 @@ pub struct AccumulatedScroll {
 
 impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
     /// Handle events from winit.
-    pub fn handle_event(&mut self, event: WinitEvent<Event>) {
+    pub fn handle_event(&mut self, event: WinitEvent) {
         match event {
             WinitEvent::UserEvent(Event { payload, .. }) => match payload {
                 EventType::SearchNext => self.ctx.goto_match(None),
@@ -1882,16 +1942,15 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         self.ctx.display.visual_bell.ring();
 
                         // Execute bell command.
-                        if let Some(bell_command) = &self.ctx.config.bell.command {
-                            if self
+                        if let Some(bell_command) = &self.ctx.config.bell.command
+                            && self
                                 .ctx
                                 .prev_bell_cmd
                                 .is_none_or(|i| i.elapsed() >= BELL_CMD_COOLDOWN)
-                            {
-                                self.ctx.spawn_daemon(bell_command.program(), bell_command.args());
+                        {
+                            self.ctx.spawn_daemon(bell_command.program(), bell_command.args());
 
-                                *self.ctx.prev_bell_cmd = Some(Instant::now());
-                            }
+                            *self.ctx.prev_bell_cmd = Some(Instant::now());
                         }
                     },
                     TerminalEvent::ClipboardStore(clipboard_type, content) => {
@@ -1950,7 +2009,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         let font = self.ctx.config.font.clone();
                         display_update_pending.set_font(font.with_size(self.ctx.display.font_size));
                     },
-                    WindowEvent::Resized(size) => {
+                    WindowEvent::SurfaceResized(size) => {
                         // Ignore resize events to zero in any dimension, to avoid issues with Winit
                         // and the ConPTY. A 0x0 resize will also occur when the window is minimized
                         // on Windows.
@@ -1964,19 +2023,46 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                         self.key_input(event);
                     },
                     WindowEvent::ModifiersChanged(modifiers) => self.modifiers_input(modifiers),
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        self.ctx.window().set_mouse_visible(true);
-                        self.mouse_input(state, button);
+                    WindowEvent::PointerButton { state, button, primary, position, .. } => {
+                        // Only handle primary pointer (mouse/first touch) and actual mouse buttons
+                        if !primary {
+                            return;
+                        }
+                        match button {
+                            ButtonSource::Mouse(mouse_button) => {
+                                self.ctx.window().set_mouse_visible(true);
+                                self.mouse_input(state, mouse_button);
+                            },
+                            ButtonSource::Touch { finger_id, .. } => {
+                                let touch = TouchPoint { id: finger_id, location: position };
+                                match state {
+                                    ElementState::Pressed => self.on_touch_start(touch),
+                                    ElementState::Released => self.on_touch_end(touch),
+                                }
+                            },
+                            _ => {},
+                        }
                     },
-                    WindowEvent::CursorMoved { position, .. } => {
-                        self.ctx.window().set_mouse_visible(true);
-                        self.mouse_moved(position);
+                    WindowEvent::PointerMoved { position, primary, source, .. } => {
+                        if !primary {
+                            return;
+                        }
+                        match source {
+                            PointerSource::Mouse => {
+                                self.ctx.window().set_mouse_visible(true);
+                                self.mouse_moved(position);
+                            },
+                            PointerSource::Touch { finger_id, .. } => {
+                                let touch = TouchPoint { id: finger_id, location: position };
+                                self.on_touch_motion(touch);
+                            },
+                            _ => {},
+                        }
                     },
                     WindowEvent::MouseWheel { delta, phase, .. } => {
                         self.ctx.window().set_mouse_visible(true);
                         self.mouse_wheel_input(delta, phase);
                     },
-                    WindowEvent::Touch(touch) => self.touch(touch),
                     WindowEvent::Focused(is_focused) => {
                         self.ctx.terminal.is_focused = is_focused;
 
@@ -1999,15 +2085,20 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                     WindowEvent::Occluded(occluded) => {
                         *self.ctx.occluded = occluded;
                     },
-                    WindowEvent::DroppedFile(path) => {
-                        let path: String = path.to_string_lossy().into();
-                        self.ctx.paste(&(path + " "), true);
+                    WindowEvent::DragDropped { paths, .. } => {
+                        // Handle the first path for backward compatibility
+                        if let Some(path) = paths.into_iter().next() {
+                            let path: String = path.to_string_lossy().into();
+                            self.ctx.paste(&(path + " "), true);
+                        }
                     },
-                    WindowEvent::CursorLeft { .. } => {
-                        self.ctx.mouse.inside_text_area = false;
+                    WindowEvent::PointerLeft { primary, .. } => {
+                        if primary {
+                            self.ctx.mouse.inside_text_area = false;
 
-                        if self.ctx.display().highlighted_hint.is_some() {
-                            *self.ctx.dirty = true;
+                            if self.ctx.display().highlighted_hint.is_some() {
+                                *self.ctx.dirty = true;
+                            }
                         }
                     },
                     WindowEvent::Ime(ime) => match ime {
@@ -2035,54 +2126,76 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                             self.ctx.display.ime.set_enabled(false);
                             *self.ctx.dirty = true;
                         },
+                        Ime::DeleteSurrounding { .. } => (),
                     },
                     WindowEvent::KeyboardInput { is_synthetic: true, .. }
                     | WindowEvent::ActivationTokenDone { .. }
                     | WindowEvent::DoubleTapGesture { .. }
                     | WindowEvent::TouchpadPressure { .. }
                     | WindowEvent::RotationGesture { .. }
-                    | WindowEvent::CursorEntered { .. }
+                    | WindowEvent::PointerEntered { .. }
                     | WindowEvent::PinchGesture { .. }
-                    | WindowEvent::AxisMotion { .. }
                     | WindowEvent::PanGesture { .. }
-                    | WindowEvent::HoveredFileCancelled
+                    | WindowEvent::DragLeft { .. }
                     | WindowEvent::Destroyed
                     | WindowEvent::ThemeChanged(_)
-                    | WindowEvent::HoveredFile(_)
+                    | WindowEvent::DragEntered { .. }
+                    | WindowEvent::DragMoved { .. }
                     | WindowEvent::RedrawRequested
                     | WindowEvent::Moved(_) => (),
                 }
             },
-            WinitEvent::Suspended
-            | WinitEvent::NewEvents { .. }
-            | WinitEvent::DeviceEvent { .. }
-            | WinitEvent::LoopExiting
-            | WinitEvent::Resumed
-            | WinitEvent::MemoryWarning
-            | WinitEvent::AboutToWait => (),
+            WinitEvent::AboutToWait => (),
         }
     }
 }
 
-#[derive(Debug, Clone)]
+/// Proxy for sending events to the event loop from any thread.
+///
+/// This wraps an `mpsc::Sender` for event data and an `EventLoopProxy` for waking the loop.
+/// The pattern is: send data through the channel, then call `wake_up()` to notify the event loop.
+/// The `ApplicationHandler::proxy_wake_up()` callback drains the channel with `try_iter()`.
+///
+/// Critical: `sender.send()` must always happen BEFORE `proxy.wake_up()` to ensure the event
+/// is in the channel before the callback fires.
+#[derive(Clone)]
 pub struct EventProxy {
-    proxy: EventLoopProxy<Event>,
+    sender: mpsc::Sender<Event>,
+    proxy: EventLoopProxy,
     window_id: WindowId,
 }
 
 impl EventProxy {
-    pub fn new(proxy: EventLoopProxy<Event>, window_id: WindowId) -> Self {
-        Self { proxy, window_id }
+    pub fn new(sender: mpsc::Sender<Event>, proxy: EventLoopProxy, window_id: WindowId) -> Self {
+        Self { sender, proxy, window_id }
     }
 
     /// Send an event to the event loop.
+    ///
+    /// Events sent through this method are tagged with this proxy's window ID.
     pub fn send_event(&self, event: EventType) {
-        let _ = self.proxy.send_event(Event::new(event, self.window_id));
+        let _ = self.sender.send(Event::new(event, self.window_id));
+        self.proxy.wake_up();
+    }
+
+    /// Send a global event (not bound to any window) to the event loop.
+    ///
+    /// Global events have `window_id = None` and are processed for all windows.
+    pub fn send_global_event(&self, event: EventType) {
+        let _ = self.sender.send(Event::new(event, None));
+        self.proxy.wake_up();
     }
 }
 
 impl EventListener for EventProxy {
     fn send_event(&self, event: TerminalEvent) {
-        let _ = self.proxy.send_event(Event::new(event.into(), self.window_id));
+        let _ = self.sender.send(Event::new(event.into(), self.window_id));
+        self.proxy.wake_up();
+    }
+}
+
+impl std::fmt::Debug for EventProxy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EventProxy").field("window_id", &self.window_id).finish()
     }
 }

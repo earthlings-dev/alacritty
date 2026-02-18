@@ -5,11 +5,11 @@ members = [
     "alacritty_config",
     "alacritty_config_derive",
 ]
-resolver = "2"
+resolver = "3"
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85.0"
+rust-version = "1.93"
 
 [profile.release]
 lto = "thin"
@@ -17,5 +17,9 @@ debug = 1
 incremental = false
 
 [workspace.dependencies]
-toml = "0.9.11"
-toml_edit = "0.24.0"
+toml = "1.0.2"
+toml_edit = "0.25.2"
+
+[patch.crates-io]
+winit = { git = "https://github.com/earthlings-dev/winit.git", branch = "master" }
+crossfont = { git = "https://github.com/earthlings-dev/crossfont.git", branch = "master" }

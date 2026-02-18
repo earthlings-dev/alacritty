@@ -50,6 +50,7 @@ For everyone else, the detailed instructions to install Alacritty can be found
 
 ### Requirements
 
+- Rust 1.93 or higher
 - At least OpenGL ES 2.0
 - [Windows] ConPTY support (Windows 10 version 1809 or higher)
 
@@ -73,6 +74,15 @@ following locations:
 On Windows, the config file will be looked for in:
 
 * `%APPDATA%\alacritty\alacritty.toml`
+
+## Architecture
+
+Alacritty uses [winit](https://github.com/rust-windowing/winit) 0.31 for window
+management and event handling. The event system uses a channel-based wake-up
+model: background threads (PTY, IPC, config watcher, etc.) send events through
+an `mpsc` channel and call `proxy.wake_up()` to notify the main event loop.
+See [`docs/winit-0.31-migration.md`](docs/winit-0.31-migration.md) for details
+on the event system design.
 
 ## Contributing
 

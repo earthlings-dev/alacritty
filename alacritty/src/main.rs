@@ -16,6 +16,7 @@ use std::error::Error;
 use std::fmt::Write as _;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::{env, fs};
 
 use log::info;
@@ -60,7 +61,7 @@ use crate::cli::SocketMessage;
 use crate::cli::{Options, Subcommands};
 use crate::config::UiConfig;
 use crate::config::monitor::ConfigMonitor;
-use crate::event::{Event, Processor};
+use crate::event::Processor;
 #[cfg(target_os = "macos")]
 use crate::macos::locale;
 
@@ -119,10 +120,10 @@ impl Drop for TemporaryFiles {
         }
 
         // Clean up logfile.
-        if let Some(log_file) = &self.log_file {
-            if fs::remove_file(log_file).is_ok() {
-                let _ = writeln!(io::stdout(), "Deleted log file at \"{}\"", log_file.display());
-            }
+        if let Some(log_file) = &self.log_file
+            && fs::remove_file(log_file).is_ok()
+        {
+            let _ = writeln!(io::stdout(), "Deleted log file at \"{}\"", log_file.display());
         }
     }
 }
@@ -133,10 +134,14 @@ impl Drop for TemporaryFiles {
 /// config change monitor, and runs the main display loop.
 fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
     // Setup winit event loop.
-    let window_event_loop = EventLoop::<Event>::with_user_event().build()?;
+    let window_event_loop = EventLoop::new()?;
+
+    // Create mpsc channel for user events.
+    let (event_sender, event_receiver) = mpsc::channel();
+    let event_proxy_raw = window_event_loop.create_proxy();
 
     // Initialize the logger as soon as possible as to capture output from other subsystems.
-    let log_file = logging::initialize(&options, window_event_loop.create_proxy())
+    let log_file = logging::initialize(&options, event_sender.clone(), event_proxy_raw.clone())
         .expect("Unable to initialize logger");
 
     info!("Welcome to Alacritty");
@@ -186,7 +191,7 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
     // Create the IPC socket listener.
     #[cfg(unix)]
     let socket_path = if config.ipc_socket() {
-        match ipc::spawn_ipc_socket(&options, window_event_loop.create_proxy()) {
+        match ipc::spawn_ipc_socket(&options, event_sender.clone(), event_proxy_raw.clone()) {
             Ok(path) => Some(path),
             Err(err) if options.daemon => return Err(err.into()),
             Err(err) => {
@@ -207,7 +212,8 @@ fn alacritty(mut options: Options) -> Result<(), Box<dyn Error>> {
     };
 
     // Event processor.
-    let mut processor = Processor::new(config, options, &window_event_loop);
+    let mut processor =
+        Processor::new(config, options, &window_event_loop, event_sender, event_receiver);
 
     // Start event loop and block until shutdown.
     let result = processor.run(window_event_loop);

@@ -21,6 +21,8 @@ Notable changes to the `alacritty_terminal` crate are documented in its
 
 ### Changed
 
+- Upgraded to winit 0.31 with architectural event system changes
+  - Kitty keyboard protocol: Hyper key press/release events supported (keycodes 57445/57451), but Hyper modifier bit (16) not tracked for key combinations due to upstream winit limitations
 - Don't highlight hints on hover when the mouse cursor is hidden
 - IME is disabled in Vi mode on X11
 - Require explicit tap to enable IME with touch input

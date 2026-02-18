@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, LineWriter, Stdout, Write};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
 use std::time::Instant;
 use std::{env, process};
 
@@ -60,11 +60,12 @@ const ALLOWED_TARGETS: &[&str] = &[
 /// Initialize the logger to its defaults.
 pub fn initialize(
     options: &Options,
-    event_proxy: EventLoopProxy<Event>,
+    event_sender: mpsc::Sender<Event>,
+    event_proxy: EventLoopProxy,
 ) -> Result<Option<PathBuf>, log::SetLoggerError> {
     log::set_max_level(options.log_level());
 
-    let logger = Logger::new(event_proxy);
+    let logger = Logger::new(event_sender, event_proxy);
     let path = logger.file_path();
     log::set_boxed_logger(Box::new(logger))?;
 
@@ -74,16 +75,23 @@ pub fn initialize(
 pub struct Logger {
     logfile: Mutex<OnDemandLogFile>,
     stdout: Mutex<LineWriter<Stdout>>,
-    event_proxy: Mutex<EventLoopProxy<Event>>,
+    event_sender: Mutex<mpsc::Sender<Event>>,
+    event_proxy: EventLoopProxy,
     start: Instant,
 }
 
 impl Logger {
-    fn new(event_proxy: EventLoopProxy<Event>) -> Self {
+    fn new(event_sender: mpsc::Sender<Event>, event_proxy: EventLoopProxy) -> Self {
         let logfile = Mutex::new(OnDemandLogFile::new());
         let stdout = Mutex::new(LineWriter::new(io::stdout()));
 
-        Logger { logfile, stdout, event_proxy: Mutex::new(event_proxy), start: Instant::now() }
+        Logger {
+            logfile,
+            stdout,
+            event_sender: Mutex::new(event_sender),
+            event_proxy,
+            start: Instant::now(),
+        }
     }
 
     fn file_path(&self) -> Option<PathBuf> {
@@ -99,8 +107,8 @@ impl Logger {
             _ => return,
         };
 
-        let event_proxy = match self.event_proxy.lock() {
-            Ok(event_proxy) => event_proxy,
+        let event_sender = match self.event_sender.lock() {
+            Ok(event_sender) => event_sender,
             Err(_) => return,
         };
 
@@ -120,7 +128,8 @@ impl Logger {
         let mut message = Message::new(message, message_type);
         message.set_target(record.target().to_owned());
 
-        let _ = event_proxy.send_event(Event::new(EventType::Message(message), None));
+        let _ = event_sender.send(Event::new(EventType::Message(message), None));
+        self.event_proxy.wake_up();
     }
 }
 

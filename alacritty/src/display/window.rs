@@ -24,19 +24,20 @@ use std::fmt::{self, Display, Formatter};
 use {
     objc2::MainThreadMarker,
     objc2_app_kit::{NSColorSpace, NSView},
-    winit::platform::macos::{OptionAsAlt, WindowAttributesExtMacOS, WindowExtMacOS},
+    winit::platform::macos::{OptionAsAlt, WindowAttributesMacOS, WindowExtMacOS},
 };
 
 use bitflags::bitflags;
-use winit::dpi::{PhysicalPosition, PhysicalSize};
+use winit::cursor::{Cursor, CursorIcon};
+use winit::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
 use winit::event_loop::ActiveEventLoop;
-use winit::monitor::MonitorHandle;
+use winit::monitor::{Fullscreen, MonitorHandle};
 #[cfg(windows)]
 use winit::platform::windows::{IconExtWindows, WindowAttributesExtWindows};
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::{
-    CursorIcon, Fullscreen, ImePurpose, Theme, UserAttentionType, Window as WinitWindow,
-    WindowAttributes, WindowId,
+    ImeCapabilities, ImeEnableRequest, ImeHint, ImePurpose, ImeRequest, ImeRequestData, Theme,
+    UserAttentionType, Window as WinitWindow, WindowAttributes, WindowId,
 };
 
 use alacritty_terminal::index::Point;
@@ -60,6 +61,9 @@ pub enum Error {
     /// Error creating the window.
     WindowCreation(winit::error::OsError),
 
+    /// Error requesting window creation.
+    WindowRequest(winit::error::RequestError),
+
     /// Error dealing with fonts.
     Font(crossfont::Error),
 }
@@ -71,6 +75,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Error::WindowCreation(err) => err.source(),
+            Error::WindowRequest(err) => err.source(),
             Error::Font(err) => err.source(),
         }
     }
@@ -79,7 +84,8 @@ impl std::error::Error for Error {
 impl Display for Error {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Error::WindowCreation(err) => write!(f, "Error creating GL context; {err}"),
+            Error::WindowCreation(err) => write!(f, "Error creating window; {err}"),
+            Error::WindowRequest(err) => write!(f, "Error requesting window; {err}"),
             Error::Font(err) => err.fmt(f),
         }
     }
@@ -88,6 +94,12 @@ impl Display for Error {
 impl From<winit::error::OsError> for Error {
     fn from(val: winit::error::OsError) -> Self {
         Error::WindowCreation(val)
+    }
+}
+
+impl From<winit::error::RequestError> for Error {
+    fn from(val: winit::error::RequestError) -> Self {
+        Error::WindowRequest(val)
     }
 }
 
@@ -113,7 +125,7 @@ pub struct Window {
     /// Hold the window when terminal exits.
     pub hold: bool,
 
-    window: WinitWindow,
+    window: Box<dyn WinitWindow>,
 
     /// Current window title.
     title: String,
@@ -129,7 +141,7 @@ impl Window {
     ///
     /// This creates a window and fully initializes a window.
     pub fn new(
-        event_loop: &ActiveEventLoop,
+        event_loop: &dyn ActiveEventLoop,
         config: &UiConfig,
         identity: &Identity,
         options: &mut WindowOptions,
@@ -187,17 +199,22 @@ impl Window {
 
         // Text cursor.
         let current_mouse_cursor = CursorIcon::Text;
-        window.set_cursor(current_mouse_cursor);
+        window.set_cursor(Cursor::from(current_mouse_cursor));
 
-        // Enable IME.
-        window.set_ime_allowed(true);
-        window.set_ime_purpose(ImePurpose::Terminal);
+        // Enable IME with cursor area support.
+        let ime_capabilities = ImeCapabilities::new().with_hint_and_purpose().with_cursor_area();
+        let ime_data =
+            ImeRequestData::default().with_hint_and_purpose(ImeHint::NONE, ImePurpose::Terminal);
+
+        if let Some(enable_request) = ImeEnableRequest::new(ime_capabilities, ime_data) {
+            let _ = window.request_ime_update(ImeRequest::Enable(enable_request));
+        }
 
         // Set initial transparency hint.
         window.set_transparent(config.window_opacity() < 1.);
 
         #[cfg(target_os = "macos")]
-        use_srgb_color_space(&window);
+        use_srgb_color_space(window.as_ref());
 
         let scale_factor = window.scale_factor();
         log::info!("Window scale factor: {scale_factor}");
@@ -223,13 +240,13 @@ impl Window {
     }
 
     #[inline]
-    pub fn request_inner_size(&self, size: PhysicalSize<u32>) {
-        let _ = self.window.request_inner_size(size);
+    pub fn request_surface_size(&self, size: PhysicalSize<u32>) {
+        let _ = self.window.request_surface_size(size.into());
     }
 
     #[inline]
-    pub fn inner_size(&self) -> PhysicalSize<u32> {
-        self.window.inner_size()
+    pub fn surface_size(&self) -> PhysicalSize<u32> {
+        self.window.surface_size()
     }
 
     #[inline]
@@ -268,7 +285,7 @@ impl Window {
     pub fn set_mouse_cursor(&mut self, cursor: CursorIcon) {
         if cursor != self.current_mouse_cursor {
             self.current_mouse_cursor = cursor;
-            self.window.set_cursor(cursor);
+            self.window.set_cursor(Cursor::from(cursor));
         }
     }
 
@@ -304,7 +321,7 @@ impl Window {
                 .expect("invalid embedded icon format")
         };
 
-        let builder = WinitWindow::default_attributes()
+        let builder = WindowAttributes::default()
             .with_name(&identity.class.general, &identity.class.instance)
             .with_decorations(window_config.decorations != Decorations::None);
 
@@ -324,7 +341,7 @@ impl Window {
     pub fn get_platform_window(_: &Identity, window_config: &WindowConfig) -> WindowAttributes {
         let icon = winit::window::Icon::from_resource(IDI_ICON, None);
 
-        WinitWindow::default_attributes()
+        WindowAttributes::default()
             .with_decorations(window_config.decorations != Decorations::None)
             .with_window_icon(icon.as_ref().ok().cloned())
             .with_taskbar_icon(icon.ok())
@@ -336,26 +353,28 @@ impl Window {
         window_config: &WindowConfig,
         tabbing_id: &Option<String>,
     ) -> WindowAttributes {
-        let mut window =
-            WinitWindow::default_attributes().with_option_as_alt(window_config.option_as_alt());
+        let mut macos_attrs =
+            WindowAttributesMacOS::default().with_option_as_alt(window_config.option_as_alt());
 
         if let Some(tabbing_id) = tabbing_id {
-            window = window.with_tabbing_identifier(tabbing_id);
+            macos_attrs = macos_attrs.with_tabbing_identifier(tabbing_id);
         }
 
-        match window_config.decorations {
-            Decorations::Full => window,
-            Decorations::Transparent => window
+        macos_attrs = match window_config.decorations {
+            Decorations::Full => macos_attrs,
+            Decorations::Transparent => macos_attrs
                 .with_title_hidden(true)
                 .with_titlebar_transparent(true)
                 .with_fullsize_content_view(true),
-            Decorations::Buttonless => window
+            Decorations::Buttonless => macos_attrs
                 .with_title_hidden(true)
                 .with_titlebar_buttons_hidden(true)
                 .with_titlebar_transparent(true)
                 .with_fullsize_content_view(true),
-            Decorations::None => window.with_titlebar_hidden(true),
-        }
+            Decorations::None => macos_attrs.with_titlebar_hidden(true),
+        };
+
+        WindowAttributes::default().with_platform_attributes(Box::new(macos_attrs))
     }
 
     pub fn set_urgent(&self, is_urgent: bool) {
@@ -385,7 +404,7 @@ impl Window {
     }
 
     pub fn set_resize_increments(&self, increments: PhysicalSize<f32>) {
-        self.window.set_resize_increments(Some(increments));
+        self.window.set_surface_resize_increments(Some(increments.into()));
     }
 
     /// Toggle the window's fullscreen state.
@@ -442,7 +461,20 @@ impl Window {
     pub fn set_ime_inhibitor(&mut self, inhibitor: ImeInhibitor, inhibit: bool) {
         if self.ime_inhibitor.contains(inhibitor) != inhibit {
             self.ime_inhibitor.set(inhibitor, inhibit);
-            self.window.set_ime_allowed(self.ime_inhibitor.is_empty());
+
+            // Enable or disable IME based on inhibitor state.
+            if self.ime_inhibitor.is_empty() {
+                let ime_capabilities =
+                    ImeCapabilities::new().with_hint_and_purpose().with_cursor_area();
+                let ime_data = ImeRequestData::default()
+                    .with_hint_and_purpose(ImeHint::NONE, ImePurpose::Terminal);
+
+                if let Some(enable_request) = ImeEnableRequest::new(ime_capabilities, ime_data) {
+                    let _ = self.window.request_ime_update(ImeRequest::Enable(enable_request));
+                }
+            } else {
+                let _ = self.window.request_ime_update(ImeRequest::Disable);
+            }
         }
     }
 
@@ -461,10 +493,11 @@ impl Window {
         let width = size.cell_width() as f64 * 2.;
         let height = size.cell_height as f64;
 
-        self.window.set_ime_cursor_area(
-            PhysicalPosition::new(nspot_x, nspot_y),
-            PhysicalSize::new(width, height),
-        );
+        let position: Position = PhysicalPosition::new(nspot_x, nspot_y).into();
+        let size: Size = PhysicalSize::new(width, height).into();
+
+        let ime_data = ImeRequestData::default().with_cursor_area(position, size);
+        let _ = self.window.request_ime_update(ImeRequest::Update(ime_data));
     }
 
     /// Disable macOS window shadows.
@@ -524,7 +557,7 @@ bitflags! {
 }
 
 #[cfg(target_os = "macos")]
-fn use_srgb_color_space(window: &WinitWindow) {
+fn use_srgb_color_space(window: &dyn WinitWindow) {
     let view = match window.window_handle().unwrap().as_raw() {
         RawWindowHandle::AppKit(handle) => {
             assert!(MainThreadMarker::new().is_some());

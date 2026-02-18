@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Error as IoError, ErrorKind, Result as IoResul
 use std::net::Shutdown;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use std::{env, fs, process};
 
 use log::{error, warn};
@@ -25,7 +25,8 @@ const ALACRITTY_SOCKET_ENV: &str = "ALACRITTY_SOCKET";
 /// Create an IPC socket.
 pub fn spawn_ipc_socket(
     options: &Options,
-    event_proxy: EventLoopProxy<Event>,
+    event_sender: mpsc::Sender<Event>,
+    event_proxy: EventLoopProxy,
 ) -> IoResult<PathBuf> {
     // Create the IPC socket and export its path as env.
 
@@ -67,21 +68,26 @@ pub fn spawn_ipc_socket(
             match message {
                 SocketMessage::CreateWindow(options) => {
                     let event = Event::new(EventType::CreateWindow(options), None);
-                    let _ = event_proxy.send_event(event);
+                    let _ = event_sender.send(event);
+                    event_proxy.wake_up();
                 },
                 SocketMessage::Config(ipc_config) => {
                     let window_id = ipc_config
                         .window_id
-                        .and_then(|id| u64::try_from(id).ok())
-                        .map(WindowId::from);
+                        .and_then(|id| usize::try_from(id).ok())
+                        .map(WindowId::from_raw);
                     let event = Event::new(EventType::IpcConfig(ipc_config), window_id);
-                    let _ = event_proxy.send_event(event);
+                    let _ = event_sender.send(event);
+                    event_proxy.wake_up();
                 },
                 SocketMessage::GetConfig(config) => {
-                    let window_id =
-                        config.window_id.and_then(|id| u64::try_from(id).ok()).map(WindowId::from);
+                    let window_id = config
+                        .window_id
+                        .and_then(|id| usize::try_from(id).ok())
+                        .map(WindowId::from_raw);
                     let event = Event::new(EventType::IpcGetConfig(Arc::new(stream)), window_id);
-                    let _ = event_proxy.send_event(event);
+                    let _ = event_sender.send(event);
+                    event_proxy.wake_up();
                 },
             }
         }
